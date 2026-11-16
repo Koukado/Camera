@@ -260,4 +260,14 @@
     upload();
   };
 
-  $('retry').onclick = function () { if (pendingId && !busy) up
+  $('retry').onclick = function () { if (pendingId && !busy) upload(); };
+
+  window.addEventListener('beforeunload', function (e) {
+    if (shots.length) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  /* ---------- 開始 ---------- */
+  if (load('kk_staff')) showMain(); else showSetup();
+</script>
+</body>
+</html>
