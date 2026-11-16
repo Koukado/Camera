@@ -1,86 +1,86 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>カメラ試作</title>
-<style>
-  body { margin: 0; font-family: -apple-system, "Hiragino Sans", sans-serif; background: #000; color: #fff; }
-  #wrap { position: relative; width: 100vw; height: 100vw; overflow: hidden; background: #111; }
-  video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  #bar { padding: 12px; display: flex; gap: 16px; align-items: center; justify-content: center; }
-  #shutter { width: 72px; height: 72px; border-radius: 50%; border: 4px solid #888; background: #fff; }
-  #shutter:active { background: #bbb; }
-  #count { min-width: 50px; text-align: center; font-size: 18px; }
-  .s { padding: 12px 16px; font-size: 16px; border-radius: 10px; border: 0; background: #1a73e8; color: #fff; }
-  #thumbs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 4px; }
-  #thumbs img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
-  #info { font-size: 14px; padding: 8px 12px; color: #ddd; line-height: 1.6; white-space: pre-wrap; }
-  #big img { width: 100%; display: block; }
-</style>
-</head>
-<body>
-  <div id="wrap"><video id="v" autoplay playsinline muted></video></div>
-  <div id="bar">
-    <span id="count">0枚</span>
-    <button id="shutter" aria-label="シャッター"></button>
-    <button class="s" id="show">最後の1枚を拡大</button>
-  </div>
-  <div id="thumbs"></div>
-  <div id="info">カメラを起動しています…</div>
-  <div id="big"></div>
-<script>
-  const v = document.getElementById('v');
-  const info = document.getElementById('info');
-  const shots = [];
+/** 連続撮影画面（GitHub Pages）からの受付 */
 
-  async function start() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 4032 }, height: { ideal: 3024 } },
-        audio: false
-      });
-      v.srcObject = stream;
-      await v.play();
-      const s = stream.getVideoTracks()[0].getSettings();
-      const side = Math.min(s.width || 0, s.height || 0);
-      info.textContent = 'カメラ起動OK\n映像の解像度：' + s.width + '×' + s.height + '\n正方形で保存できる最大サイズ：' + side + '×' + side;
-    } catch (e) {
-      info.textContent = 'カメラを起動できませんでした\n' + e.name + '：' + e.message;
-    }
+// 撮影画面から送信できるメールアドレス（スタッフが増えたらここに追加）
+const ALLOWED_STAFF = [
+  'info@koukado.world'
+];
+
+function doPost(e) {
+  let res;
+  try {
+    const req = JSON.parse(e.postData.contents);
+    const staff = checkStaff_(req.staff);
+    if (req.action === 'check') res = { ok: true };
+    else if (req.action === 'photo') res = savePhotoFromCamera_(req, staff);
+    else throw new Error('不明な操作です');
+  } catch (err) {
+    res = { ok: false, error: err.message };
   }
+  return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+}
 
-  document.getElementById('shutter').onclick = function () {
-    const w = v.videoWidth, h = v.videoHeight;
-    if (!w) return;
-    const side = Math.min(w, h);
-    const c = document.createElement('canvas');
-    c.width = side;
-    c.height = side;
-    c.getContext('2d').drawImage(v, (w - side) / 2, (h - side) / 2, side, side, 0, 0, side, side);
-    const url = c.toDataURL('image/jpeg', 0.9);
-    shots.push({ url: url, side: side });
-    const img = document.createElement('img');
-    img.src = url;
-    document.getElementById('thumbs').appendChild(img);
-    document.getElementById('count').textContent = shots.length + '枚';
-  };
+function checkStaff_(staff) {
+  const s = String(staff || '').trim().toLowerCase();
+  const list = ALLOWED_STAFF.map(x => String(x).trim().toLowerCase());
+  if (list.indexOf(s) === -1) throw new Error('このメールアドレスは登録されていません（管理者に連絡してください）');
+  return s;
+}
 
-  document.getElementById('show').onclick = function () {
-    if (!shots.length) { info.textContent += '\n先に撮影してください'; return; }
-    const last = shots[shots.length - 1];
-    const big = document.getElementById('big');
-    big.innerHTML = '';
-    const p = document.createElement('div');
-    p.id = 'info';
-    p.textContent = '最後の1枚（' + last.side + '×' + last.side + '）。長押しで「写真」に保存し、拡大して画質を確認してください。';
-    const img = document.createElement('img');
-    img.src = last.url;
-    big.appendChild(p);
-    big.appendChild(img);
-  };
+function savePhotoFromCamera_(req, staff) {
+  const id = String(req.id || '').trim();
+  const index = Number(req.index);
+  const data = String(req.image || '');
+  if (!/^[0-9a-f]{8}$/.test(id)) throw new Error('IDが不正です');
+  if (!(index >= 1 && index <= PHOTO_COLS.length)) throw new Error('写真の番号が不正です');
+  if (data.indexOf('data:image/jpeg;base64,') !== 0) throw new Error('画像の形式が不正です');
+  if (data.length > 8 * 1024 * 1024) throw new Error('画像が大きすぎます');
 
-  start();
-</script>
-</body>
-</html>
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+    const lastCol = sheet.getLastColumn();
+    const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v).trim());
+    const col = name => {
+      const i = header.indexOf(name);
+      if (i === -1) throw new Error('列「' + name + '」が見つかりません');
+      return i;
+    };
+    const cId = col('ID');
+    const findRow = () => {
+      const last = sheet.getLastRow();
+      if (last < 2) return -1;
+      const ids = sheet.getRange(2, cId + 1, last - 1, 1).getValues();
+      for (let i = ids.length - 1; i >= 0; i--) {
+        if (String(ids[i][0]).trim() === id) return i + 2;
+      }
+      return -1;
+    };
+
+    const now = new Date();
+    let rowNum = findRow();
+    if (rowNum === -1) {
+      const row = new Array(lastCol).fill('');
+      row[cId] = id;
+      row[col('撮影日')] = Utilities.formatDate(now, TZ, 'yyyy/MM/dd');
+      row[col('撮影担当')] = staff;
+      row[col('ステータス')] = '撮影済み';
+      row[col('登録日時')] = Utilities.formatDate(now, TZ, 'yyyy/MM/dd HH:mm:ss');
+      sheet.appendRow(row);
+      SpreadsheetApp.flush();
+      rowNum = findRow();
+      if (rowNum === -1) throw new Error('商品の登録に失敗しました');
+    }
+
+    const colName = PHOTO_COLS[index - 1];
+    const name = id + '.' + colName + '.' + Utilities.formatDate(now, TZ, 'HHmmss') + '.jpg';
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.split(',')[1]), 'image/jpeg', name);
+    const folder = getOrCreateFolder_(DriveApp.getFolderById(APP_FOLDER_ID), IMAGE_FOLDER_NAME);
+    folder.createFile(blob);
+    sheet.getRange(rowNum, col(colName) + 1).setValue(IMAGE_FOLDER_NAME + '/' + name);
+    SpreadsheetApp.flush();
+    return { ok: true, id: id, index: index };
+  } finally {
+    lock.releaseLock();
+  }
+}
