@@ -13,6 +13,11 @@
   header { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px; font-size: 13px; color: #ccc; }
   header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   header button { flex-shrink: 0; background: none; border: 1px solid #555; color: #ccc; border-radius: 8px; padding: 4px 10px; font-size: 13px; }
+  #queue { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 12px; font-size: 13px; min-height: 32px; }
+  #queue.idle { color: #7ee787; }
+  #queue.busy { color: #f2cc60; }
+  #queue.fail { color: #ff7b72; }
+  #queue button { flex-shrink: 0; display: none; background: #c62828; border: 0; color: #fff; border-radius: 8px; padding: 6px 10px; font-size: 13px; }
   #wrap { position: relative; width: 100vw; height: 100vw; max-width: 600px; max-height: 600px; margin: 0 auto; overflow: hidden; background: #111; }
   video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   #flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .15s; }
@@ -31,7 +36,6 @@
   #msg { padding: 10px 16px; font-size: 15px; line-height: 1.6; min-height: 2em; }
   .ok { color: #7ee787; }
   .err { color: #ff7b72; }
-  #retry { display: none; margin: 0 16px 16px; padding: 14px; width: calc(100% - 32px); border: 0; border-radius: 10px; background: #c62828; color: #fff; font-size: 16px; }
   #setup { display: none; padding: 24px 20px; }
   #setup h1 { font-size: 20px; margin: 0 0 8px; }
   #setup p { color: #bbb; font-size: 14px; line-height: 1.6; }
@@ -57,6 +61,7 @@
     <span id="who"></span>
     <button id="toSetup">設定</button>
   </header>
+  <div id="queue" class="idle"><span id="qText">送信待ちはありません</span><button id="qRetry">今すぐ再送信</button></div>
   <div id="wrap"><video id="v" autoplay playsinline muted></video><div id="flash"></div></div>
   <div id="bar">
     <span id="count">0 / 10枚</span>
@@ -65,19 +70,18 @@
   </div>
   <div id="thumbs"></div>
   <div id="msg">カメラを起動しています…</div>
-  <button id="retry">もう一度送信する</button>
 </section>
 
 <script>
   const API = 'https://script.google.com/macros/s/AKfycbwjRrZqs0XHFISQoIV6ewMN8NPKPPyau6P5B2KgkwUoXnD8RdmF2z3lg5_3TNdpkCmy_Q/exec';
   const MAX = 10;
   const SIZE = 1600;
+  const DB_NAME = 'kk_camera';
+  const STORE = 'queue';
 
   const $ = id => document.getElementById(id);
   const v = $('v');
   let shots = [];
-  let pendingId = null;
-  let busy = false;
 
   function load(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
   function store(k, val) { try { localStorage.setItem(k, val); } catch (e) {} }
@@ -91,12 +95,140 @@
 
   function msg(text, cls) { $('msg').textContent = text; $('msg').className = cls || ''; }
 
-  async function post(body) {
-    const r = await fetch(API, { method: 'POST', body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || '保存に失敗しました');
-    return j;
+  function newId() {
+    const a = new Uint8Array(4);
+    crypto.getRandomValues(a);
+    return Array.from(a).map(b => ('0' + b.toString(16)).slice(-2)).join('');
   }
+
+  async function post(body, timeoutMs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 120000);
+    try {
+      const r = await fetch(API, { method: 'POST', body: JSON.stringify(body), signal: ctl.signal });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || '保存に失敗しました');
+      return j;
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('通信がタイムアウトしました');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* ---------- 送信待ちの保管（iPhone内） ---------- */
+  let db = null;
+  let useMem = false;
+  let memQueue = [];
+
+  function openDB() {
+    return new Promise(function (resolve, reject) {
+      const r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore(STORE, { keyPath: 'key' }); };
+      r.onsuccess = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  function qAdd(item) {
+    if (useMem) { memQueue.push(item); return Promise.resolve(); }
+    return new Promise(function (resolve, reject) {
+      const t = db.transaction(STORE, 'readwrite');
+      t.objectStore(STORE).put(item);
+      t.oncomplete = function () { resolve(); };
+      t.onerror = function () { reject(t.error); };
+    });
+  }
+
+  function qFirst() {
+    if (useMem) return Promise.resolve(memQueue[0] || null);
+    return new Promise(function (resolve, reject) {
+      const r = db.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
+      r.onsuccess = function () { resolve(r.result ? r.result.value : null); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  function qDel(key) {
+    if (useMem) { memQueue = memQueue.filter(function (x) { return x.key !== key; }); return Promise.resolve(); }
+    return new Promise(function (resolve, reject) {
+      const t = db.transaction(STORE, 'readwrite');
+      t.objectStore(STORE).delete(key);
+      t.oncomplete = function () { resolve(); };
+      t.onerror = function () { reject(t.error); };
+    });
+  }
+
+  function qCount() {
+    if (useMem) return Promise.resolve(memQueue.length);
+    return new Promise(function (resolve, reject) {
+      const r = db.transaction(STORE, 'readonly').objectStore(STORE).count();
+      r.onsuccess = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  /* ---------- 裏で送信 ---------- */
+  let working = false;
+  let sending = false;
+  let waitTimer = null;
+  let failCount = 0;
+  let lastError = '';
+  let pendingCount = 0;
+
+  async function updateStatus() {
+    try { pendingCount = await qCount(); } catch (e) {}
+    const box = $('queue');
+    const btn = $('qRetry');
+    if (pendingCount === 0) {
+      box.className = 'idle';
+      $('qText').textContent = '送信待ちはありません';
+      btn.style.display = 'none';
+    } else if (lastError && !sending) {
+      box.className = 'fail';
+      $('qText').textContent = '未送信 ' + pendingCount + '件：' + lastError + '（自動で再送信します）';
+      btn.style.display = 'block';
+    } else {
+      box.className = 'busy';
+      $('qText').textContent = '送信中… 残り ' + pendingCount + '件';
+      btn.style.display = 'none';
+    }
+  }
+
+  async function kick() {
+    if (waitTimer) { clearTimeout(waitTimer); waitTimer = null; }
+    if (working) return;
+    working = true;
+    try {
+      while (true) {
+        const item = await qFirst();
+        if (!item) break;
+        sending = true;
+        await updateStatus();
+        try {
+          await post({ action: 'photos', staff: item.staff, id: item.id, images: item.images });
+          await qDel(item.key);
+          failCount = 0;
+          lastError = '';
+        } catch (e) {
+          failCount++;
+          lastError = e.message || '送信に失敗しました';
+          sending = false;
+          const delay = Math.min(60, 5 * Math.pow(2, failCount - 1)) * 1000;
+          waitTimer = setTimeout(kick, delay);
+          break;
+        }
+      }
+    } finally {
+      working = false;
+      sending = false;
+      await updateStatus();
+    }
+  }
+
+  $('qRetry').onclick = function () { failCount = 0; kick(); };
+  window.addEventListener('online', function () { kick(); });
 
   /* ---------- 初期設定 ---------- */
   function showSetup() {
@@ -117,7 +249,7 @@
     m.textContent = '確認中…';
     m.className = '';
     try {
-      await post({ action: 'check', staff: staff });
+      await post({ action: 'check', staff: staff }, 30000);
       store('kk_staff', staff);
       showMain();
     } catch (e) {
@@ -129,7 +261,6 @@
   $('toSetup').onclick = function () {
     if (shots.length && !confirm('撮影中の写真は消えます。設定画面に移りますか？')) return;
     shots = [];
-    pendingId = null;
     render();
     showSetup();
   };
@@ -145,21 +276,26 @@
       });
       v.srcObject = stream;
       await v.play();
-      if (!busy && !pendingId) msg('撮影できます。最大10枚まで撮れます。');
+      if (!shots.length) msg(useMem
+        ? '撮影できます。※この端末では一時保存が使えないため、送信が終わるまで画面を閉じないでください。'
+        : '撮影できます。最大10枚まで撮れます。', useMem ? 'err' : '');
     } catch (e) {
       msg('カメラを起動できませんでした（' + e.name + '）。iPhoneの設定でSafariのカメラを「許可」にしてください。', 'err');
     }
   }
 
   function stopCamera() {
-    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
     stream = null;
   }
 
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && $('main').style.display !== 'none') {
-      const live = stream && stream.getVideoTracks().some(t => t.readyState === 'live');
-      if (!live) startCamera();
+    if (document.visibilityState === 'visible') {
+      kick();
+      if ($('main').style.display !== 'none') {
+        const live = stream && stream.getVideoTracks().some(function (t) { return t.readyState === 'live'; });
+        if (!live) startCamera();
+      }
     }
   });
 
@@ -177,7 +313,7 @@
 
   /* ---------- 撮影 ---------- */
   $('shutter').onclick = function () {
-    if (busy || pendingId || shots.length >= MAX) return;
+    if (shots.length >= MAX) return;
     const w = v.videoWidth, h = v.videoHeight;
     if (!w) return;
     const side = Math.min(w, h);
@@ -203,71 +339,61 @@
       img.src = url;
       const n = document.createElement('span');
       n.textContent = i + 1;
+      const x = document.createElement('button');
+      x.textContent = '×';
+      x.setAttribute('aria-label', (i + 1) + '枚目を削除');
+      x.onclick = function () {
+        if (confirm((i + 1) + '枚目を削除しますか？')) { shots.splice(i, 1); render(); }
+      };
       d.appendChild(img);
       d.appendChild(n);
-      if (!busy && !pendingId) {
-        const x = document.createElement('button');
-        x.textContent = '×';
-        x.setAttribute('aria-label', (i + 1) + '枚目を削除');
-        x.onclick = function () {
-          if (confirm((i + 1) + '枚目を削除しますか？')) { shots.splice(i, 1); render(); }
-        };
-        d.appendChild(x);
-      }
+      d.appendChild(x);
       box.appendChild(d);
     });
     $('count').textContent = shots.length + ' / ' + MAX + '枚';
-    $('shutter').disabled = busy || !!pendingId || shots.length >= MAX;
-    $('save').disabled = busy || !!pendingId || shots.length === 0;
-    $('retry').style.display = pendingId && !busy ? 'block' : 'none';
+    $('shutter').disabled = shots.length >= MAX;
+    $('save').disabled = shots.length === 0;
   }
 
-  /* ---------- 送信（まとめて1回） ---------- */
-  function newId() {
-    const a = new Uint8Array(4);
-    crypto.getRandomValues(a);
-    return Array.from(a).map(b => ('0' + b.toString(16)).slice(-2)).join('');
-  }
-
-  async function upload() {
-    busy = true;
-    render();
-    const total = shots.length;
-    const started = Date.now();
-    const body = { action: 'photos', staff: load('kk_staff'), id: pendingId, images: shots };
-    msg('送信中…（' + total + '枚）画面を閉じないでください');
+  /* ---------- 保存（受付して次へ） ---------- */
+  $('save').onclick = async function () {
+    if (!shots.length) return;
+    $('save').disabled = true;
+    const item = {
+      key: String(Date.now()).padStart(15, '0') + '_' + newId(),
+      id: newId(),
+      staff: load('kk_staff'),
+      images: shots.slice(),
+      createdAt: Date.now()
+    };
     try {
-      try { await post(body); }
-      catch (e) { msg('再送信中…（' + total + '枚）'); await post(body); }
-      const sec = Math.round((Date.now() - started) / 1000);
-      busy = false;
-      pendingId = null;
-      shots = [];
-      addToday();
-      updateWho();
-      render();
-      msg('保存しました（' + total + '枚・' + sec + '秒）。管理番号は約1分後に付きます。続けて次の商品を撮影できます。', 'ok');
+      await qAdd(item);
     } catch (e) {
-      busy = false;
-      render();
-      msg('送信できませんでした：' + e.message + '　電波の良い場所で「もう一度送信する」を押してください。', 'err');
+      msg('端末への一時保存に失敗しました：' + e.message, 'err');
+      $('save').disabled = false;
+      return;
     }
-  }
-
-  $('save').onclick = function () {
-    if (!shots.length || busy) return;
-    pendingId = newId();
-    upload();
+    const n = shots.length;
+    shots = [];
+    addToday();
+    updateWho();
+    render();
+    msg('受け付けました（' + n + '枚）。続けて次の商品を撮影できます。送信は自動で行います。', 'ok');
+    await updateStatus();
+    kick();
   };
 
-  $('retry').onclick = function () { if (pendingId && !busy) upload(); };
-
   window.addEventListener('beforeunload', function (e) {
-    if (shots.length) { e.preventDefault(); e.returnValue = ''; }
+    if (shots.length || pendingCount > 0) { e.preventDefault(); e.returnValue = ''; }
   });
 
   /* ---------- 開始 ---------- */
-  if (load('kk_staff')) showMain(); else showSetup();
+  (async function init() {
+    try { db = await openDB(); } catch (e) { useMem = true; }
+    if (load('kk_staff')) showMain(); else showSetup();
+    await updateStatus();
+    kick();
+  })();
 </script>
 </body>
 </html>
