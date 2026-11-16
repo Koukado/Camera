@@ -222,7 +222,7 @@
     $('retry').style.display = pendingId && !busy ? 'block' : 'none';
   }
 
-  /* ---------- 送信 ---------- */
+  /* ---------- 送信（まとめて1回） ---------- */
   function newId() {
     const a = new Uint8Array(4);
     crypto.getRandomValues(a);
@@ -233,20 +233,20 @@
     busy = true;
     render();
     const total = shots.length;
+    const started = Date.now();
+    const body = { action: 'photos', staff: load('kk_staff'), id: pendingId, images: shots };
+    msg('送信中…（' + total + '枚）画面を閉じないでください');
     try {
-      for (let i = 0; i < total; i++) {
-        msg('送信中… ' + (i + 1) + ' / ' + total + '枚（画面を閉じないでください）');
-        const body = { action: 'photo', staff: load('kk_staff'), id: pendingId, index: i + 1, image: shots[i] };
-        try { await post(body); }
-        catch (e) { await post(body); }
-      }
+      try { await post(body); }
+      catch (e) { msg('再送信中…（' + total + '枚）'); await post(body); }
+      const sec = Math.round((Date.now() - started) / 1000);
       busy = false;
       pendingId = null;
       shots = [];
       addToday();
       updateWho();
       render();
-      msg('保存しました（' + total + '枚）。管理番号は約1分後に付きます。続けて次の商品を撮影できます。', 'ok');
+      msg('保存しました（' + total + '枚・' + sec + '秒）。管理番号は約1分後に付きます。続けて次の商品を撮影できます。', 'ok');
     } catch (e) {
       busy = false;
       render();
