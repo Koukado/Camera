@@ -50,8 +50,8 @@
 <section id="setup">
   <h1>幸華堂カメラ 初期設定</h1>
   <p>最初の1回だけ入力します。この端末に保存されます。</p>
-  <label for="inStaff">撮影担当（AppSheetにログインするメールアドレス）</label>
-  <input id="inStaff" type="email" autocomplete="email" autocapitalize="off" spellcheck="false">
+  <label for="inStaff">撮影者コード（管理者から受け取ったもの）</label>
+  <input id="inStaff" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="例：kk-abc123">
   <button id="setupSave">保存して始める</button>
   <div id="setupMsg"></div>
 </section>
@@ -239,18 +239,19 @@
   }
 
   $('setupSave').onclick = async function () {
-    const staff = $('inStaff').value.trim().toLowerCase();
+    const code = $('inStaff').value.trim().toLowerCase();
     const m = $('setupMsg');
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(staff)) {
-      m.textContent = 'メールアドレスを正しく入力してください';
+    if (!code) {
+      m.textContent = '撮影者コードを入力してください';
       m.className = 'err';
       return;
     }
     m.textContent = '確認中…';
     m.className = '';
     try {
-      await post({ action: 'check', staff: staff }, 30000);
-      store('kk_staff', staff);
+      const j = await post({ action: 'check', staff: code }, 30000);
+      store('kk_staff', code);
+      store('kk_name', j.name || code);
       showMain();
     } catch (e) {
       m.textContent = e.message;
@@ -308,7 +309,7 @@
   }
 
   function updateWho() {
-    $('who').textContent = '担当：' + load('kk_staff') + '　本日 ' + todayCount() + '件';
+    $('who').textContent = '担当：' + (load('kk_name') || load('kk_staff')) + '　本日 ' + todayCount() + '件';
   }
 
   /* ---------- 撮影 ---------- */
