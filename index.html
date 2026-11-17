@@ -1,3 +1,6 @@
+
+index.html
+100%
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -81,7 +84,7 @@
 
   const $ = id => document.getElementById(id);
   const v = $('v');
-  let shots = [];
+  let shots = []; // { blob, url, t }
 
   function load(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
   function store(k, val) { try { localStorage.setItem(k, val); } catch (e) {} }
@@ -101,6 +104,16 @@
     return Array.from(a).map(b => ('0' + b.toString(16)).slice(-2)).join('');
   }
 
+  function blobToDataURL(b) {
+    if (typeof b === 'string') return Promise.resolve(b); // 旧版で保存した送信待ち
+    return new Promise(function (resolve, reject) {
+      const r = new FileReader();
+      r.onload = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error); };
+      r.readAsDataURL(b);
+    });
+  }
+
   async function post(body, timeoutMs) {
     const ctl = new AbortController();
     const timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 120000);
@@ -111,6 +124,7 @@
       return j;
     } catch (e) {
       if (e.name === 'AbortError') throw new Error('通信がタイムアウトしました');
+      if (e instanceof TypeError) throw new Error('電波がない、または通信できません');
       throw e;
     } finally {
       clearTimeout(timer);
@@ -138,6 +152,7 @@
       t.objectStore(STORE).put(item);
       t.oncomplete = function () { resolve(); };
       t.onerror = function () { reject(t.error); };
+      t.onabort = function () { reject(t.error || new Error('保存できませんでした')); };
     });
   }
 
@@ -169,6 +184,33 @@
     });
   }
 
+  async function storageText() {
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const e = await navigator.storage.estimate();
+        const mb = Math.round((e.usage || 0) / 1048576);
+        const nearFull = e.quota && e.usage / e.quota > 0.8;
+        return { text: '（端末内 約' + mb + 'MB）', nearFull: nearFull };
+      }
+    } catch (e) {}
+    return { text: '', nearFull: false };
+  }
+
+  /* ---------- 画面を消さない（送信待ちがある間） ---------- */
+  let wakeLock = null;
+  async function updateWake() {
+    try {
+      const need = pendingCount > 0 && document.visibilityState === 'visible';
+      if (need && 'wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', function () { wakeLock = null; });
+      } else if (!need && wakeLock) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    } catch (e) {}
+  }
+
   /* ---------- 裏で送信 ---------- */
   let working = false;
   let sending = false;
@@ -185,15 +227,20 @@
       box.className = 'idle';
       $('qText').textContent = '送信待ちはありません';
       btn.style.display = 'none';
-    } else if (lastError && !sending) {
-      box.className = 'fail';
-      $('qText').textContent = '未送信 ' + pendingCount + '件：' + lastError + '（自動で再送信します）';
-      btn.style.display = 'block';
     } else {
-      box.className = 'busy';
-      $('qText').textContent = '送信中… 残り ' + pendingCount + '件';
-      btn.style.display = 'none';
+      const s = await storageText();
+      if (lastError && !sending) {
+        box.className = 'fail';
+        $('qText').textContent = '未送信 ' + pendingCount + '件' + s.text + '：' + lastError + '（自動で再送信します）';
+        btn.style.display = 'block';
+      } else {
+        box.className = 'busy';
+        $('qText').textContent = '送信中… 残り ' + pendingCount + '件' + s.text;
+        btn.style.display = 'none';
+      }
+      if (s.nearFull) msg('iPhoneの保存容量が少なくなっています。電波の良い場所で送信が進むまで、撮影を控えてください。', 'err');
     }
+    updateWake();
   }
 
   async function kick() {
@@ -207,7 +254,8 @@
         sending = true;
         await updateStatus();
         try {
-          await post({ action: 'photos', staff: item.staff, id: item.id, images: item.images });
+          const images = await Promise.all(item.images.map(blobToDataURL));
+          await post({ action: 'photos', staff: item.staff, id: item.id, images: images, capturedAt: item.capturedAt || item.createdAt });
           await qDel(item.key);
           failCount = 0;
           lastError = '';
@@ -261,6 +309,7 @@
 
   $('toSetup').onclick = function () {
     if (shots.length && !confirm('撮影中の写真は消えます。設定画面に移りますか？')) return;
+    shots.forEach(function (s) { URL.revokeObjectURL(s.url); });
     shots = [];
     render();
     showSetup();
@@ -293,6 +342,7 @@
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible') {
       kick();
+      updateWake();
       if ($('main').style.display !== 'none') {
         const live = stream && stream.getVideoTracks().some(function (t) { return t.readyState === 'live'; });
         if (!live) startCamera();
@@ -313,38 +363,48 @@
   }
 
   /* ---------- 撮影 ---------- */
+  let capturing = false;
   $('shutter').onclick = function () {
-    if (shots.length >= MAX) return;
+    if (capturing || shots.length >= MAX) return;
     const w = v.videoWidth, h = v.videoHeight;
     if (!w) return;
+    capturing = true;
     const side = Math.min(w, h);
     const out = Math.min(SIZE, side);
     const c = document.createElement('canvas');
     c.width = out;
     c.height = out;
     c.getContext('2d').drawImage(v, (w - side) / 2, (h - side) / 2, side, side, 0, 0, out, out);
-    shots.push(c.toDataURL('image/jpeg', 0.85));
     const f = $('flash');
     f.style.opacity = '0.7';
     setTimeout(function () { f.style.opacity = '0'; }, 80);
-    render();
+    c.toBlob(function (b) {
+      capturing = false;
+      if (!b) { msg('撮影に失敗しました。もう一度押してください。', 'err'); return; }
+      shots.push({ blob: b, url: URL.createObjectURL(b), t: Date.now() });
+      render();
+    }, 'image/jpeg', 0.85);
   };
 
   function render() {
     const box = $('thumbs');
     box.innerHTML = '';
-    shots.forEach(function (url, i) {
+    shots.forEach(function (s, i) {
       const d = document.createElement('div');
       d.className = 't';
       const img = document.createElement('img');
-      img.src = url;
+      img.src = s.url;
       const n = document.createElement('span');
       n.textContent = i + 1;
       const x = document.createElement('button');
       x.textContent = '×';
       x.setAttribute('aria-label', (i + 1) + '枚目を削除');
       x.onclick = function () {
-        if (confirm((i + 1) + '枚目を削除しますか？')) { shots.splice(i, 1); render(); }
+        if (confirm((i + 1) + '枚目を削除しますか？')) {
+          URL.revokeObjectURL(s.url);
+          shots.splice(i, 1);
+          render();
+        }
       };
       d.appendChild(img);
       d.appendChild(n);
@@ -364,17 +424,22 @@
       key: String(Date.now()).padStart(15, '0') + '_' + newId(),
       id: newId(),
       staff: load('kk_staff'),
-      images: shots.slice(),
+      images: shots.map(function (s) { return s.blob; }),
+      capturedAt: shots[0].t,
       createdAt: Date.now()
     };
     try {
       await qAdd(item);
     } catch (e) {
-      msg('端末への一時保存に失敗しました：' + e.message, 'err');
+      const full = e && (e.name === 'QuotaExceededError' || /quota/i.test(String(e.message)));
+      msg(full
+        ? 'iPhoneの保存容量がいっぱいです。この商品の写真は残っています。電波の良い場所で送信が進んでから、もう一度「保存して次へ」を押してください。'
+        : '端末への一時保存に失敗しました：' + (e && e.message ? e.message : e), 'err');
       $('save').disabled = false;
       return;
     }
     const n = shots.length;
+    shots.forEach(function (s) { URL.revokeObjectURL(s.url); });
     shots = [];
     addToday();
     updateWho();
@@ -391,6 +456,7 @@
   /* ---------- 開始 ---------- */
   (async function init() {
     try { db = await openDB(); } catch (e) { useMem = true; }
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
     if (load('kk_staff')) showMain(); else showSetup();
     await updateStatus();
     kick();
@@ -398,3 +464,4 @@
 </script>
 </body>
 </html>
+1 / 7 ページ
